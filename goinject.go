@@ -107,11 +107,11 @@ func Process(modifier Modifier) {
 	newArgs := copiedArgs[:goFilesIndex]
 
 	pwd := os.Args[1]
+	hasStdFlag := slices.Contains(args, "-std")
 
 	// Go through each file and modify it if it is a project file.
 	for _, filePathToCompile := range filesToCompile {
 		isGoFile := filepath.Ext(filePathToCompile) == ".go"
-		hasStdFlag := slices.Contains(args, "-std")
 		projectFile := strings.HasPrefix(filePathToCompile, pwd)
 
 		// We skip non .go files, std library files, and non-project files to avoid patching them.
@@ -162,6 +162,12 @@ func Process(modifier Modifier) {
 	// Run the the original `go tool compile` command with new arguments
 	// to propagate our changes to the compiler.
 	runCommand(newArgs[2], newArgs[3:])
+}
+
+// Evaluate evaluate a go file and return its processed content into a buffer
+func Evaluate(modifier Modifier, path string) (*bytes.Buffer, error) {
+	out, _, err := evaluateFile(path, modifier)
+	return out, err
 }
 
 // extractFilesFromPack extracts all the go files from args.
@@ -248,12 +254,37 @@ func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath stri
 // processFile returns the path to the modified file, as well as all its relevant imports,
 // which we will need when patching importcfg file.
 func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.ImportSpec, error) {
-	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
-	resolver, err := packagesResolver()
+	out, decorator, err := evaluateFile(path, modifier)
 	if err != nil {
 		return "", nil, err
 	}
 
+	// Write our modified file to the temporary directory we created at the beginning.
+	newFileName := tmpDir + string(os.PathSeparator) + filepath.Base(path)
+	output(newFileName, out)
+
+	// Read modified file to retrieve relevant imports.
+	// Since apparently it is impossible to see changed imports in
+	// the already decorated file. I could be wrong.
+	// But explicit rereading definitely works.
+	f, err := dstFile(newFileName, decorator)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return newFileName, f.Imports, nil
+}
+
+// evaluateFile performs parsing a file's AST, making changes to that AST, and writing the modified AST as
+// a buffer.
+// Obtain returns the new buffer, as well as all its relevant imports,
+// which we will need when patching importcfg file.
+func evaluateFile(path string, modifier Modifier) (*bytes.Buffer, *decorator.Decorator, error) {
+	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
+	resolver, err := packagesResolver()
+	if err != nil {
+		return nil, nil, err
+	}
 	// NewRestorerWithImports is needed to add imports to the file that
 	// are required for the code we injected as part of the modifications.
 	// For example, if the original file does not have an import of the "fmt" package,
@@ -264,11 +295,11 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 
 	f, err := dstFile(path, decorator)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 
 	if f == nil {
-		return "", nil, fmt.Errorf("received nil dst.File for: %s", path)
+		return nil, nil, fmt.Errorf("received nil dst.File for: %s", path)
 	}
 
 	// Make the necessary changes to the AST file
@@ -276,24 +307,7 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 
 	var out bytes.Buffer
 	err = restorer.Fprint(&out, f)
-	if err != nil {
-		return "", nil, err
-	}
-
-	// Write our modified file to the temporary directory we created at the beginning.
-	newFileName := tmpDir + string(os.PathSeparator) + filepath.Base(path)
-	output(newFileName, &out)
-
-	// Read modified file to retrieve relevant imports.
-	// Since apparently it is impossible to see changed imports in
-	// the already decorated file. I could be wrong.
-	// But explicit rereading definitely works.
-	f, err = dstFile(newFileName, decorator)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return newFileName, f.Imports, nil
+	return &out, decorator, err
 }
 
 // dstFile parses the .go file at the specified path and returns an
